@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.mintToken = mintToken;
 const wallet_1 = require("./wallet");
 const spl_token_1 = require("@solana/spl-token");
+const createMetadata_1 = require("./utils/createMetadata");
 async function mintToken() {
     const connection = (0, wallet_1.getConnection)();
     if (!process.env.PRIVATE_KEY)
@@ -18,6 +19,24 @@ async function mintToken() {
     await mintAccount.mintTo(tokenAccountInfo.address, payer, [], mintAmount);
     console.log(`✅ Mint created: ${mintAccount.publicKey.toBase58()}`);
     console.log(`📦 Token Account: ${tokenAccountInfo.address.toBase58()}`);
+    // إضافة metadata تلقائيًا
+    const name = process.env.TOKEN_NAME || 'TOKEN';
+    const symbol = process.env.TOKEN_SYMBOL || 'TOKEN';
+    const uri = process.env.TOKEN_URI || 'https://arweave.net/placeholder.json';
+    try {
+        await (0, createMetadata_1.createTokenMetadata)({
+            connection,
+            mint: mintAccount.publicKey,
+            payer,
+            name,
+            symbol,
+            uri
+        });
+        console.log('✅ تم إضافة metadata (اسم/رمز/رابط صورة) للتوكن بنجاح!');
+    }
+    catch (err) {
+        console.error('⚠️ فشل إضافة metadata للتوكن:', err);
+    }
     return {
         mint: mintAccount.publicKey.toBase58(),
         tokenAccount: tokenAccountInfo.address.toBase58(),

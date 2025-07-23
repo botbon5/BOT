@@ -1,0 +1,16 @@
+{
+  "5766632997": {
+    "trades": 0,
+    "activeTrades": 1,
+    "history": [
+      "pump.fun strategy saved: Volume ≥ 6, Holders ≥ 30, Age ≥ 1 min",
+      "pump.fun strategy saved: Volume ≥ 4, Holders ≥ 25, Age ≥ 1 min"
+    ],
+    "lastMessageAt": 1753311620053,
+    "strategy": {
+      "minVolume": 4,
+      "minHolders": 25,
+      "minAge": 1
+    }
+  }
+}
