@@ -44,10 +44,6 @@ export async function fetchPumpFunTokens(): Promise<PumpFunToken[]> {
     });
     if (tokens.length) return tokens;
   } catch (e) {}
-  // fallback: return mock tokens
-  return [
-    { symbol: 'MOCK1', address: 'MockAddress1', volume: 1000, holders: 50, ageMinutes: 5, marketCap: 50000 },
-    { symbol: 'MOCK2', address: 'MockAddress2', volume: 2000, holders: 80, ageMinutes: 10, marketCap: 120000 },
-    { symbol: 'MOCK3', address: 'MockAddress3', volume: 500, holders: 20, ageMinutes: 2, marketCap: 20000 }
-  ];
+  // fallback: return empty array (no mock tokens)
+  return [];
 }
