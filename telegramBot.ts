@@ -57,9 +57,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { Keypair } from '@solana/web3.js';
+import { parseSolanaPrivateKey, toBase64Key } from './keyFormat';
 import { fetchTokenInfo, fetchTrendingBirdeye, fetchTrendingPumpFun } from './utils/tokenSources';
 import { autoBuy } from './utils/autoBuy';
-import { sellWithOrca } from './sell';
+import { unifiedBuy, unifiedSell } from './tradeSources';
 import { helpMessages } from './helpMessages';
 // User type definition
 interface User {
@@ -124,7 +125,7 @@ bot.action('restore_wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
   awaitingUsers[userId] = 'await_restore_secret';
   await ctx.reply(
-    '🔑 To restore your wallet, please send your private key in base64 format (usually about 88 characters).\nExample:\nM3J5dG...Z2F0ZQ==\n\n⚠️ Never share your private key with anyone!\nYou can press Cancel to exit.',
+    '🔑 To restore your wallet, please send your Solana private key in one of the following formats:\n\n1. Base58 (most common, 44-88 characters, letters & numbers)\n2. Base64 (88 characters)\n3. JSON Array (64 numbers)\n\nExample (Base58):\n4f3k2...\nExample (Base64):\nM3J5dG...Z2F0ZQ==\nExample (JSON Array):\n[12,34,...]\n\n⚠️ Never share your private key with anyone!\nYou can press Cancel to exit.',
     {...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_restore_wallet')]])}
   );
 });
@@ -312,8 +313,9 @@ bot.action('confirm_sell_all_wallet', async (ctx) => {
   let results: string[] = [];
   for (const t of user._pendingSellAll) {
     try {
-      const tx = await sellWithOrca(t.token_address, t.token_amount);
-      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
+      const secret = typeof user.secret === 'string' ? user.secret : '';
+      const { tx, source } = await unifiedSell(t.token_address, t.token_amount, secret);
+      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | Source: ${source} | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
     } catch (e: any) {
       results.push(`❌ <b>${t.token_symbol || '-'}:</b> Failed to sell | ${e?.message || 'Error'}`);
     }
@@ -484,8 +486,9 @@ bot.action('confirm_sell_all_wallet', async (ctx) => {
   let results: string[] = [];
   for (const t of user._pendingSellAll) {
     try {
-      const tx = await sellWithOrca(t.token_address, t.token_amount);
-      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
+      const secret = typeof user.secret === 'string' ? user.secret : '';
+      const { tx, source } = await unifiedSell(t.token_address, t.token_amount, secret);
+      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | Source: ${source} | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
     } catch (e: any) {
       results.push(`❌ <b>${t.token_symbol || '-'}:</b> Failed to sell | ${e?.message || 'Error'}`);
     }
@@ -756,49 +759,12 @@ bot.on('text', async (ctx) => {
 
   // Restore wallet from private key
   if (awaitingUsers[userId] === 'await_restore_secret') {
-    // 1. Try base64 directly
-    let base64Key = text;
-    let secretKey: Buffer | null = null;
-    let success = false;
-    try {
-      secretKey = Buffer.from(base64Key, 'base64');
-      if (secretKey.length === 64) success = true;
-    } catch {}
-    // 2. If not, try plain text (not base64, not JSON array)
-    if (!success && /^[A-Za-z0-9]{64,}$/.test(text) && text.length >= 64 && text.length <= 100) {
-      try {
-        // Convert plain text to bytes (utf-8), pad or trim to 64 bytes
-        let buf = Buffer.from(text, 'utf-8');
-        if (buf.length < 64) {
-          // Pad with zeros if less than 64 bytes
-          let padded = Buffer.alloc(64);
-          buf.copy(padded);
-          buf = padded;
-        } else if (buf.length > 64) {
-          buf = buf.slice(0, 64);
-        }
-        secretKey = buf;
-        base64Key = buf.toString('base64');
-        if (secretKey.length === 64) success = true;
-      } catch {}
-    }
-    // 3. If not, try if user entered numbers (JSON Array)
-    if (!success && text.startsWith('[') && text.endsWith(']')) {
-      try {
-        const arr = JSON.parse(text);
-        if (Array.isArray(arr) && arr.length === 64) {
-          secretKey = Buffer.from(arr);
-          base64Key = secretKey.toString('base64');
-          success = true;
-        }
-      } catch {}
-    }
-    // 4. If conversion succeeded
-    if (success && secretKey) {
+    const secretKey = parseSolanaPrivateKey(text);
+    if (secretKey && secretKey.length === 64) {
       try {
         const keypair = Keypair.fromSecretKey(secretKey);
         users[userId].wallet = keypair.publicKey.toBase58();
-        users[userId].secret = base64Key;
+        users[userId].secret = toBase64Key(secretKey);
         users[userId].history = users[userId].history || [];
         users[userId].history.push('Wallet restored from private key');
         saveUsers();
@@ -808,8 +774,7 @@ bot.on('text', async (ctx) => {
         return;
       } catch (e: any) {}
     }
-    // 5. If everything failed
-    await ctx.reply('❌ Invalid or unsupported private key. Please send your Solana secret key in base64, plain text, or as a JSON array.\nPress Cancel to exit.');
+    await ctx.reply('❌ Invalid or unsupported private key. Please send your Solana secret key in Base58, Base64, or as a JSON array.\nPress Cancel to exit.');
     return;
   }
 // Cancel wallet restore button
@@ -937,9 +902,9 @@ async function honeyAutoBuy(address: string, amount: number, secret: string): Pr
 }
 
 async function honeyAutoSell(address: string, amount: number, secret: string): Promise<string> {
-  // Use existing sellWithOrca logic
-  await sellWithOrca(address, amount);
-  return '';
+  // Use unifiedSell logic
+  const { tx } = await unifiedSell(address, amount, secret);
+  return tx;
 }
 
 async function honeyMonitor() {
@@ -1027,6 +992,72 @@ setInterval(honeyMonitor, 5000); // Real-time: every 5 seconds
         [Markup.button.callback('Show Active Targets', 'show_active_targets')]
       ]) }
     );
+    // Show actual strategy results (top tokens)
+    await ctx.reply('Fetching tokens matching your strategy ...');
+    try {
+      let tokens = await getCachedTokenList();
+      if (!tokens || tokens.length === 0) {
+        await ctx.reply('No tokens found from the available sources. Try again later.');
+        return;
+      }
+      // Apply user strategy filter if available
+      const strat = user.strategy;
+      let filtered = tokens;
+      if (strat && strat.enabled) {
+        filtered = tokens.filter((t: any) => {
+          let ok = true;
+          if (typeof strat.minVolume === 'number') {
+            if (typeof t.volume === 'number') ok = ok && t.volume >= strat.minVolume;
+            else ok = ok && true;
+          }
+          if (typeof strat.minHolders === 'number') {
+            if (typeof t.holders === 'number') ok = ok && t.holders >= strat.minHolders;
+            else ok = ok && true;
+          }
+          if (typeof strat.minAge === 'number') {
+            if (typeof t.age === 'number') ok = ok && t.age >= strat.minAge;
+            else ok = ok && true;
+          }
+          return ok;
+        });
+      }
+      // Sort by volume if available
+      const sorted = filtered
+        .filter((t: any) => typeof t.volume === 'number')
+        .sort((a: any, b: any) => b.volume - a.volume)
+        .slice(0, 10);
+
+      user.lastTokenList = sorted;
+      user.history = user.history || [];
+      user.history.push('Viewed tokens matching strategy');
+      saveUsers();
+
+      let msg = '<b>Top Solana tokens matching your strategy:</b>\n';
+      if (sorted.length === 0) {
+        msg += '\nNo tokens match your strategy at the moment.';
+      } else {
+        msg += sorted.map((t: any, i: number) => {
+          let symbol = t.symbol || '-';
+          let name = t.name || '-';
+          let solscanLink = `https://solscan.io/token/${t.address}`;
+          let volume = t.volume ? t.volume.toLocaleString() : '-';
+          let maxVol = sorted[0]?.volume || 1;
+          let barLen = Math.round((t.volume / maxVol) * 20);
+          let bar = '▮'.repeat(barLen) + '▯'.repeat(20 - barLen);
+          return `\n${i+1}. <b>${symbol}:</b> <code>${t.address}</code>\n` +
+            `Name: ${name}\n` +
+            `Volume: ${volume} <code>${bar}</code>\n` +
+            `<a href='${solscanLink}'>View on Solscan</a>\n` +
+            `<b>Add to Honey Points:</b> /add_honey_${i}`;
+        }).join('\n');
+      }
+      await ctx.reply(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[Markup.button.callback('Refresh', 'refresh_tokens')]])
+      });
+    } catch (e: any) {
+      await ctx.reply('Error fetching tokens: ' + getErrorMessage(e));
+    }
     return;
   }
 // Show current strategy
@@ -1057,14 +1088,15 @@ bot.command('strategy_show', async (ctx) => {
     }
     try {
       const amount = 0.01; // Default buy amount in SOL
-      const tx = await autoBuy(tokenMint, amount, user.secret);
+      const { tx, source } = await unifiedBuy(tokenMint, amount, user.secret);
       user.history = user.history || [];
-      user.history.push(`Buy: ${tokenMint} | Amount: ${amount} SOL | Tx: ${tx}`);
+      user.history.push(`Buy: ${tokenMint} | Amount: ${amount} SOL | Source: ${source} | Tx: ${tx}`);
       saveUsers();
       await ctx.reply(
         `✅ <b>Buy order sent successfully!</b>\n\n` +
         `<b>Token:</b> <code>${tokenMint}</code>\n` +
         `<b>Amount:</b> ${amount} SOL\n` +
+        `<b>Source:</b> ${source}\n` +
         `<b>Transaction:</b> <a href=\"https://solscan.io/tx/${tx}\">${tx}</a>\n\n` +
         `You can track it on Solscan or any Solana explorer.`,
         {
@@ -1080,6 +1112,7 @@ bot.command('strategy_show', async (ctx) => {
         `• <b>Wallet:</b> <code>${user.wallet}</code>\n` +
         `• <b>Token:</b> <code>${tokenMint}</code>\n` +
         `• <b>Amount:</b> ${amount} SOL\n` +
+        `• <b>Source:</b> ${source}\n` +
         `• <b>Tx:</b> <a href=\"https://solscan.io/tx/${tx}\">${tx}</a>`,
         { parse_mode: 'HTML' }
       );
@@ -1102,14 +1135,15 @@ bot.command('strategy_show', async (ctx) => {
     }
     try {
       const amount = 0.01; // Default sell amount in SOL (can be improved to fetch actual balance)
-      const tx = await sellWithOrca(tokenMint, amount);
+      const { tx, source } = await unifiedSell(tokenMint, amount, user.secret);
       user.history = user.history || [];
-      user.history.push(`Sell: ${tokenMint} | Amount: ${amount} SOL | Tx: ${tx}`);
+      user.history.push(`Sell: ${tokenMint} | Amount: ${amount} SOL | Source: ${source} | Tx: ${tx}`);
       saveUsers();
       await ctx.reply(
         `✅ <b>Sell order sent successfully!</b>\n\n` +
         `<b>Token:</b> <code>${tokenMint}</code>\n` +
         `<b>Amount:</b> ${amount} SOL\n` +
+        `<b>Source:</b> ${source}\n` +
         `<b>Transaction:</b> <a href=\"https://solscan.io/tx/${tx}\">${tx}</a>\n\n` +
         `You can track it on Solscan or any Solana explorer.`,
         { parse_mode: 'HTML' }
@@ -1120,6 +1154,7 @@ bot.command('strategy_show', async (ctx) => {
         `• <b>Wallet:</b> <code>${user.wallet}</code>\n` +
         `• <b>Token:</b> <code>${tokenMint}</code>\n` +
         `• <b>Amount:</b> ${amount} SOL\n` +
+        `• <b>Source:</b> ${source}\n` +
         `• <b>Tx:</b> <a href=\"https://solscan.io/tx/${tx}\">${tx}</a>`,
         { parse_mode: 'HTML' }
       );
