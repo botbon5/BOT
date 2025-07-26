@@ -1,4 +1,53 @@
+// ===== Improvements integration =====
+import {
+  loadingMessage,
+  showWalletBalance,
+  confirmExportKey,
+  setPriceAlert,
+  showProfitChart,
+  secretKeyWarning,
+  onboardingTips,
+  detailedHelp
+} from './improvements';
+
+// Onboarding tips for new users (call after wallet creation or restore)
+// Example usage: onboardingTips(ctx);
+
+// Show wallet balance (call from wallet view)
+// Example usage: showWalletBalance(ctx, users[userId]);
+
+// Confirm export private key (call before showing secret)
+// Example usage: confirmExportKey(ctx, users[userId]);
+
+// Price alert setup (call from strategy or token view)
+// Example usage: setPriceAlert(ctx, users[userId]);
+
+// Profit/loss summary (call from activity or wallet view)
+// Example usage: showProfitChart(ctx, users[userId]);
+
+// Private key warning (call before export or restore)
+// Example usage: secretKeyWarning(ctx);
+
+// Detailed help (call from /help command)
+// Example usage: detailedHelp(ctx);
+// ====== Copy Trading Monitoring (imported) ======
+import { monitorCopiedWallets } from './utils/portfolioCopyMonitor';
+// ====== Global Token Cache for Sniper Speed ======
+let globalTokenCache: any[] = [];
+let lastCacheUpdate = 0;
+const CACHE_TTL = 60 * 1000; // 1 minute
+
+async function getCachedTokenList() {
+  const now = Date.now();
+  if (globalTokenCache.length === 0 || now - lastCacheUpdate > CACHE_TTL) {
+    globalTokenCache = await fetchSolanaTokenList();
+    lastCacheUpdate = now;
+  }
+  return globalTokenCache;
+}
 // ========== Background Monitor for Profit/Stop Targets ========== //
+import { fetchSolanaTokenList } from './utils/githubTokenList';
+import { executeHoneyStrategy, getHoneySettings, addHoneyToken } from './userStrategy';
 import { setInterval } from 'timers';
 import fs from 'fs';
 import { Markup, Telegraf } from 'telegraf';
@@ -8,115 +57,158 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { Keypair } from '@solana/web3.js';
-import { fetchBirdeyeTokens } from './utils/birdeyeTokens';
-import { fetchPumpFunTokens } from './utils/pumpFunApi';
+import { fetchTokenInfo, fetchTrendingBirdeye, fetchTrendingPumpFun } from './utils/tokenSources';
 import { autoBuy } from './utils/autoBuy';
 import { sellWithOrca } from './sell';
+import { helpMessages } from './helpMessages';
+// User type definition
+interface User {
+  wallet?: string;
+  secret?: string;
+  trades?: number;
+  activeTrades?: number;
+  history?: string[];
+  referrer?: string;
+  referrals?: string[];
+  strategy?: {
+    minVolume?: number;
+    minHolders?: number;
+    minAge?: number;
+    enabled?: boolean;
+  };
+  lastTokenList?: any[];
+  honeyTemp?: any;
+  _pendingSellAll?: any[];
+  copiedWallets?: string[];
+  lastMessageAt?: number;
+}
 
-// Replace with your actual sticker ID or import from a config/constants file
-const WELCOME_STICKER = 'CAACAgUAAxkBAAEBQY1kZ...';
+// Helper: getErrorMessage
+function getErrorMessage(e: any): string {
+  return e?.message || String(e);
+}
 
+// Helper: limitHistory
+function limitHistory(user: User) {
+  if (user.history && user.history.length > 100) {
+    user.history = user.history.slice(-100);
+  }
+}
+
+// Helper: sendFeeAndReferral (stub)
+async function sendFeeAndReferral(amount: number, userId: string, type: string) {
+  // Implement fee/referral logic here if needed
+}
+// Telegram bot
+export const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+
+// Telegram bot core variables
+let users: Record<string, User> = loadUsers();
+let awaitingUsers: Record<string, any> = {};
+
+function getUserInviteLink(userId: string, ctx?: any): string {
+  // Use env BOT_USERNAME or fallback to ctx.botInfo.username
+  const botUsername = process.env.BOT_USERNAME || ctx?.botInfo?.username || 'YourBotUsername';
+  return `https://t.me/${botUsername}?start=${userId}`;
+}
+
+// Welcome sticker
+const WELCOME_STICKER = 'CAACAgUAAxkBAAEBQY1kZ...'; // Welcome sticker ID
+
+// Users file
 const USERS_FILE = 'users.json';
 let boughtTokens: Record<string, Set<string>> = {};
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+// Restore Wallet button handler
+bot.action('restore_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  awaitingUsers[userId] = 'await_restore_secret';
+  await ctx.reply(
+    '🔑 To restore your wallet, please send your private key in base64 format (usually about 88 characters).\nExample:\nM3J5dG...Z2F0ZQ==\n\n⚠️ Never share your private key with anyone!\nYou can press Cancel to exit.',
+    {...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_restore_wallet')]])}
+  );
+});
 
-// ========== User Types ========== //
-type UserStrategy = {
-  minVolume?: number;
-  minHolders?: number;
-  minAge?: number;
-  enabled?: boolean;
-};
-type User = {
-  trades: number;
-  activeTrades: number;
-  history: string[];
-  wallet?: string;
-  secret?: string;
-  strategy?: UserStrategy;
-  lastMessageAt?: number;
-  profitTargets?: Record<string, number>; // tokenMint -> target price in SOL
-  stopLosses?: Record<string, number>;   // tokenMint -> stop loss price in SOL
-  referrer?: string; // userId of inviter
-  referrals?: string[]; // userIds of invitees
-  referralEarnings?: number; // in SOL
-};
+// Create Wallet button handler
+bot.action('create_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  // Generate new wallet
+  const keypair = Keypair.generate();
+  users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
+  users[userId].wallet = keypair.publicKey.toBase58();
+  users[userId].secret = Buffer.from(keypair.secretKey).toString('base64');
+  users[userId].history = users[userId].history || [];
+  users[userId].history.push('Created new wallet');
+  saveUsers();
+  await ctx.reply('✅ New wallet created! Your address: ' + users[userId].wallet);
+  await sendMainMenu(ctx);
+});
 
-
-
-const awaitingUsers: Record<string, any> = Object.create(null);
-const pendingWalletVerifications: Record<string, any> = Object.create(null);
-// ========== Button Action Handlers for Buy, Sell, Strategy ========== //
-// === Referral & Fee System ===
-
-const users: Record<string, User> = loadUsers();
-
-function getReferralPercent(refCount: number) {
-  if (refCount >= 1000) return 0.7;
-  if (refCount >= 100) return 0.4;
-  return 0.2;
-}
-
-
-function getUserInviteLink(userId: string) {
-  return `https://t.me/${bot.botInfo?.username || 'YOUR_BOT_USERNAME'}?start=${userId}`;
-}
-
-async function sendFeeAndReferral(amountSOL: number, userId: string, txType: string) {
-  // Fee: max(1 USD in SOL, 10% of amount)
-  let solPrice = 0;
-  try {
-    const solRes = await fetch('https://public-api.birdeye.so/public/price?address=So11111111111111111111111111111111111111112');
-    const solData = await solRes.json();
-    solPrice = solData?.data?.value || 0;
-  } catch {}
-  const minFeeSOL = solPrice ? 1 / solPrice : 0.01;
-  let fee = Math.max(minFeeSOL, amountSOL * 0.1);
-  // For profit auto-sell, only 8% of profit
-  if (txType === 'profit') fee = amountSOL * 0.08;
-  if (fee <= 0) return;
-  // Send fee to bot wallet (simulate, replace with real transfer in production)
-  // await sendSol(users[userId].wallet, BOT_FEE_WALLET, fee);
-  // Referral reward
-  const refId = users[userId]?.referrer;
-  if (refId && users[refId]) {
-    const refCount = users[refId].referrals?.length || 0;
-    const percent = getReferralPercent(refCount);
-    const reward = fee * percent;
-    if (reward > 0) {
-      users[refId].referralEarnings = (users[refId].referralEarnings || 0) + reward;
-      // await sendSol(BOT_FEE_WALLET, users[refId].wallet, reward);
-      await bot.telegram.sendMessage(refId,
-        `🎁 You earned a referral reward of <b>${reward.toFixed(4)} SOL</b> from your friend <code>${userId}</code>!`,
-        { parse_mode: 'HTML' }
-      );
-    }
-    fee -= reward;
+// Export Private Key button handler
+bot.action('exportkey', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  if (!user || !user.secret) {
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
-  // The rest stays in bot wallet
+  await ctx.reply('⚠️ Your private key (base64):\n' + user.secret, { parse_mode: 'Markdown' });
+});
+
+// Back to main menu button handler
+bot.action('back_to_menu', async (ctx) => {
+  await sendMainMenu(ctx);
+});
+
+// ====== User, wallet, and menu helper functions ======
+function loadUsers(): Record<string, User> {
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      const raw = fs.readFileSync(USERS_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch {}
+  return {};
+}
+
+function saveUsers() {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  } catch {}
+}
+
+function hasWallet(user?: User): boolean {
+  return !!(user && user.wallet && user.secret);
+}
+
+function walletKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔑 Restore Wallet', 'restore_wallet'), Markup.button.callback('🆕 Create Wallet', 'create_wallet')]
+  ]);
 }
 
 bot.action('buy', async (ctx) => {
   const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.buy);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to buy tokens. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   awaitingUsers[userId + '_buy'] = true;
-  await ctx.reply('🔍 Send the token mint address to buy:');
+  await ctx.reply('🔍 Please send the token mint address to buy:');
 });
 
 bot.action('sell', async (ctx) => {
   const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.sell);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to sell tokens. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   awaitingUsers[userId + '_sell'] = true;
-  await ctx.reply('💰 Send the token mint address to sell:');
+  await ctx.reply('💰 Please send the token mint address to sell:');
 });
 
 bot.action('set_strategy', async (ctx) => {
   const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.strategy);
   awaitingUsers[userId] = 'await_strategy_all';
   await ctx.reply(
     '⚙️ <b>Enter your strategy as: volume,holders,age</b>\nExample: <code>1000,50,10</code>\n' +
@@ -128,110 +220,40 @@ bot.action('set_strategy', async (ctx) => {
   );
 });
 
-function loadUsers(): Record<string, User> {
-  try {
-    if (fs.existsSync(USERS_FILE)) {
-      const data = fs.readFileSync(USERS_FILE, 'utf8');
-      const parsed = JSON.parse(data);
-      if (parsed.__boughtTokens) {
-        boughtTokens = {};
-        for (const userId in parsed.__boughtTokens) {
-          boughtTokens[userId] = new Set(parsed.__boughtTokens[userId]);
-        }
-        delete parsed.__boughtTokens;
-      }
-      return parsed;
-    }
-  } catch (e) {
-    console.error('Failed to load users:', e);
-  }
-  return Object.create(null);
-}
-
-function saveUsers() {
-  try {
-    const data = { ...users, __boughtTokens: {} as Record<string, string[]> };
-    for (const userId in boughtTokens) {
-      (data.__boughtTokens as Record<string, string[]>)[userId] = Array.from(boughtTokens[userId]);
-    }
-    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error('Failed to save users:', e);
-  }
-}
-
-function hasWallet(user: User) {
-  return !!user?.wallet && !!user?.secret;
-}
-
-function walletKeyboard() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('Restore Wallet', 'restore_wallet')],
-    [Markup.button.callback('Create New Wallet', 'create_wallet')],
-    [Markup.button.callback('Cancel', 'cancel_input')]
-  ]);
-}
-
-function limitHistory(user: User) {
-  if (user.history.length > 50) {
-    user.history = user.history.slice(-50);
-  }
-}
-
-function getErrorMessage(e: any): string {
-  return typeof e === 'object' && e && 'message' in e ? e.message : String(e);
-}
-
-
-async function sendMainMenu(ctx: any) {
-  await ctx.replyWithSticker(WELCOME_STICKER).catch(() => {});
+bot.action('honey_points', async (ctx) => {
   const userId = String(ctx.from?.id);
-  const user = users[userId] || {};
-  let activityPreview = '';
-  if (user.history && user.history.length) {
-    const last3 = user.history.slice(-3).reverse();
-    activityPreview = '\n\n<b>Recent Activity:</b>\n' + last3.map((h) => `• ${h}`).join('\n');
-  }
+  await ctx.reply(helpMessages.honey_points);
+  awaitingUsers[userId] = 'await_honey_address';
   await ctx.reply(
-    '🤖 <b>Welcome to the trading bot!</b>\n\n' +
-   'Choose what you want to do from the buttons below 👇' +
-    activityPreview,
-    {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('🪙 Tokens', 'tokens'), Markup.button.callback('💸 Buy', 'buy')],
-        [Markup.button.callback('💰 Sell', 'sell'), Markup.button.callback('⚙️ Strategy', 'set_strategy')],
-        [Markup.button.callback('🧾 My Activity', 'show_activity'), Markup.button.callback('👛 My Wallet', 'my_wallet')],
-        [Markup.button.callback('👥 Invite Friends', 'invite_friends'), Markup.button.callback('❓ Help', 'help')],
-        [Markup.button.callback('🔄 Main Menu', 'back_to_menu')]
-      ])
-    }
-  );
-}
-
-// Invite Friends button (English)
-bot.action('invite_friends', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const inviteLink = getUserInviteLink(userId);
-  await ctx.reply(
-    `👥 <b>Invite Friends</b>\n\n` +
-    `Share this link with your friends and earn rewards every time they trade using the bot!\n\n` +
-    `<b>Your personal invite link:</b>\n<a href=\"${inviteLink}\">${inviteLink}</a>\n\n` +
-    `• Anyone who joins using your link will be linked to your account.\n` +
-    `• You will receive a percentage of the trading fees from your referrals.\n` +
-    `• Simply forward this message or copy the link above.`,
+    '🍯 <b>Honey Points Setup</b>\n\nStep 1/4: Enter token address:\n💡 <i>The address is the token address on Solana network.</i>',
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-      [Markup.button.url('🔗 Open Invite Link', inviteLink)],
-      [Markup.button.callback('🔄 Main Menu', 'back_to_menu')]
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_honey')]
     ]) }
   );
 });
 
+bot.action('show_activity', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.activity);
+  if (!hasWallet(users[userId])) {
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  const history = users[userId]?.history || [];
+  const text = history.length ? history.map((h) => `• ${h}`).join('\n') : 'No activity yet.';
+  await ctx.reply(`📊 *Your Activity:*\n${text}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'back_to_menu')]])
+    });
+});
+
 bot.action('my_wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.wallet);
   const user = users[userId];
   if (!user?.wallet) {
-    return ctx.reply('No wallet is linked to your account.');
+    return ctx.reply(helpMessages.no_wallet);
   }
   let msg = `<b>👛 Your Wallet Address:</b>\n<code>${user.wallet}</code>`;
   await ctx.reply(msg, {
@@ -243,35 +265,255 @@ bot.action('my_wallet', async (ctx) => {
   });
 });
 
-// ========== Wallet Setup Actions ========== //
-bot.action('restore_wallet', async (ctx) => {
+bot.action('sell_all_wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
-  awaitingUsers[userId] = 'await_restore_secret';
-  await ctx.reply('Please send your wallet private key (base64):', walletKeyboard());
-});
-
-bot.action('create_wallet', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
-  if (!users[userId].secret || !users[userId].wallet) {
-    const keypair = Keypair.generate();
-    const publicKey = keypair.publicKey.toBase58();
-    const secretKey = Buffer.from(keypair.secretKey).toString('base64');
-    users[userId].wallet = publicKey;
-    users[userId].secret = secretKey;
-    users[userId].history.push('Created new wallet');
-    saveUsers();
-    delete awaitingUsers[userId];
-    await ctx.reply('Your new Solana wallet has been created!\nAddress: ' + publicKey + '\n\n*Keep this address to receive tokens. You can export your private key later using /exportkey.*', { parse_mode: 'Markdown' });
-    await sendMainMenu(ctx);
-  } else {
-    await ctx.reply('You already have a wallet.');
+  await ctx.reply(helpMessages.sell_all);
+  const user = users[userId];
+  if (!hasWallet(user)) {
+    return ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  // Fetch tokens from wallet via Birdeye or Solscan
+  try {
+    const res = await fetch(`https://public-api.birdeye.so/public/wallet/token_list?address=${user.wallet}`);
+    const data = await res.json();
+    const tokens = Array.isArray(data?.data)
+      ? (data.data as Array<{token_address: string; token_symbol?: string; token_amount: number}>)
+          .filter((t) => t.token_amount > 0.00001)
+      : [];
+    if (!tokens.length) {
+      return ctx.reply('No tokens found in your wallet.');
+    }
+    let msg = '<b>Your wallet tokens:</b>\n';
+    msg += tokens.map((t: {token_symbol?: string; token_address: string; token_amount: number}, i: number) =>
+      `\n${i+1}. <b>${t.token_symbol || '-'}:</b> <code>${t.token_address}</code> | Amount: <b>${t.token_amount}</b>`
+    ).join('\n');
+    msg += '\n\n⚠️ <b>Are you sure you want to sell ALL tokens for SOL?</b>';
+    await ctx.reply(msg, {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm Sell All', 'confirm_sell_all_wallet')],
+        [Markup.button.callback('❌ Cancel', 'back_to_menu')]
+      ])
+    });
+    user._pendingSellAll = tokens;
+  } catch {
+    await ctx.reply('Failed to fetch wallet tokens.');
   }
 });
 
-bot.action('back_to_menu', async (ctx) => {
-  await ctx.replyWithChatAction('typing');
-  await sendMainMenu(ctx);
+// Execute mass sell after confirmation
+bot.action('confirm_sell_all_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  if (!hasWallet(user) || !Array.isArray(user._pendingSellAll)) {
+    return ctx.reply('No tokens to sell.');
+  }
+  await ctx.reply('⏳ Selling all tokens in your wallet...');
+  let results: string[] = [];
+  for (const t of user._pendingSellAll) {
+    try {
+      const tx = await sellWithOrca(t.token_address, t.token_amount);
+      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
+    } catch (e: any) {
+      results.push(`❌ <b>${t.token_symbol || '-'}:</b> Failed to sell | ${e?.message || 'Error'}`);
+    }
+  }
+  delete user._pendingSellAll;
+  await ctx.reply('<b>Sell All Results:</b>\n' + results.join('\n'), { parse_mode: 'HTML' });
+});
+
+
+// (Removed duplicate honey_points handler)
+
+// Invite Friends button (English)
+bot.action('invite_friends', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  // Use env BOT_USERNAME or fallback to ctx.botInfo.username
+  const botUsername = process.env.BOT_USERNAME || ctx.botInfo?.username || 'YourBotUsername';
+  const inviteLink = `https://t.me/${botUsername}?start=${userId}`;
+  let msg = helpMessages.invite_friends + `\n\n<b>Your Invite Link:</b> <a href='${inviteLink}'>${inviteLink}</a>`;
+  await ctx.reply(msg, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.url('🔗 Open Invite Link', inviteLink), Markup.button.callback('🔄 Main Menu', 'back_to_menu')]
+    ])
+  });
+});
+
+async function sendMainMenu(ctx: any) {
+  await ctx.reply(
+    helpMessages.main_menu,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🟢 Buy', 'buy'), Markup.button.callback('🔴 Sell', 'sell')],
+        [Markup.button.callback('⚙️ Strategy', 'set_strategy'), Markup.button.callback('🍯 Honey Points', 'honey_points')],
+        [Markup.button.callback('📊 Activity', 'show_activity'), Markup.button.callback('👛 Wallet', 'my_wallet')],
+        [Markup.button.callback('💰 Sell All', 'sell_all_wallet'), Markup.button.callback('📋 Copy Trade', 'copy_trade')],
+        [Markup.button.callback('🔗 Invite Friends', 'invite_friends')]
+      ])
+    }
+  );
+}
+
+// ========== User Registration and Wallet Setup ========== //
+
+// ...existing code...
+
+bot.action('buy', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.buy);
+  if (!hasWallet(users[userId])) {
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  awaitingUsers[userId + '_buy'] = true;
+  await ctx.reply('🔍 Send the token mint address to buy:');
+});
+
+bot.action('sell', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.sell);
+  if (!hasWallet(users[userId])) {
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  awaitingUsers[userId + '_sell'] = true;
+  await ctx.reply('💰 Send the token mint address to sell:');
+});
+
+bot.action('set_strategy', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.strategy);
+  awaitingUsers[userId] = 'await_strategy_all';
+  await ctx.reply(
+    '⚙️ <b>Enter your strategy as: volume,holders,age</b>\nExample: <code>1000,50,10</code>\n' +
+    '• volume: Minimum trading volume in USD\n' +
+    '• holders: Minimum number of holders\n' +
+    '• age: Minimum age in minutes\n' +
+    'You can disable the strategy with /strategy_off or enable it with /strategy_on',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('honey_points', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.honey_points);
+  awaitingUsers[userId] = 'await_honey_address';
+  await ctx.reply(
+    '🍯 <b>Honey Points Setup</b>\n\nStep 1/4: Enter token address:\n💡 <i>The address is the token address on Solana network.</i>',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_honey')]
+    ]) }
+  );
+});
+
+bot.action('show_activity', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.activity);
+  if (!hasWallet(users[userId])) {
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  const history = users[userId]?.history || [];
+  const text = history.length ? history.map((h) => `• ${h}`).join('\n') : 'No activity yet.';
+  await ctx.reply(`📊 *Your Activity:*\n${text}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'back_to_menu')]])
+    });
+});
+
+bot.action('my_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.wallet);
+  const user = users[userId];
+  if (!user?.wallet) {
+    return ctx.reply(helpMessages.no_wallet);
+  }
+  let msg = `<b>👛 Your Wallet Address:</b>\n<code>${user.wallet}</code>`;
+  await ctx.reply(msg, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🔑 Export Private Key', 'exportkey'), Markup.button.callback('🔄 Main Menu', 'back_to_menu')]
+    ])
+  });
+});
+
+bot.action('sell_all_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.sell_all);
+  const user = users[userId];
+  if (!hasWallet(user)) {
+    return ctx.reply(helpMessages.wallet_needed, walletKeyboard());
+  }
+  // Fetch tokens from wallet via Birdeye or Solscan
+  try {
+    const res = await fetch(`https://public-api.birdeye.so/public/wallet/token_list?address=${user.wallet}`);
+    const data = await res.json();
+    const tokens = Array.isArray(data?.data)
+      ? (data.data as Array<{token_address: string; token_symbol?: string; token_amount: number}>)
+          .filter((t) => t.token_amount > 0.00001)
+      : [];
+    if (!tokens.length) {
+      return ctx.reply('No tokens found in your wallet.');
+    }
+    let msg = '<b>Your wallet tokens:</b>\n';
+    msg += tokens.map((t: {token_symbol?: string; token_address: string; token_amount: number}, i: number) =>
+      `\n${i+1}. <b>${t.token_symbol || '-'}:</b> <code>${t.token_address}</code> | Amount: <b>${t.token_amount}</b>`
+    ).join('\n');
+    msg += '\n\n⚠️ <b>Are you sure you want to sell ALL tokens for SOL?</b>';
+    await ctx.reply(msg, {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm Sell All', 'confirm_sell_all_wallet'), Markup.button.callback('❌ Cancel', 'back_to_menu')]
+      ])
+    });
+    user._pendingSellAll = tokens;
+  } catch {
+    await ctx.reply('Failed to fetch wallet tokens.');
+  }
+});
+
+// Execute mass sell after confirmation
+bot.action('confirm_sell_all_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  if (!hasWallet(user) || !Array.isArray(user._pendingSellAll)) {
+    return ctx.reply('No tokens to sell.');
+  }
+  await ctx.reply('⏳ Selling all tokens in your wallet...');
+  let results: string[] = [];
+  for (const t of user._pendingSellAll) {
+    try {
+      const tx = await sellWithOrca(t.token_address, t.token_amount);
+      results.push(`✅ <b>${t.token_symbol || '-'}:</b> Sold <b>${t.token_amount}</b> | <a href="https://solscan.io/tx/${tx}">View Transaction</a>`);
+    } catch (e: any) {
+      results.push(`❌ <b>${t.token_symbol || '-'}:</b> Failed to sell | ${e?.message || 'Error'}`);
+    }
+  }
+  delete user._pendingSellAll;
+  await ctx.reply('<b>Sell All Results:</b>\n' + results.join('\n'), { parse_mode: 'HTML' });
+});
+
+
+// (Removed duplicate honey_points handler)
+
+// Invite Friends button (English)
+bot.action('invite_friends', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const inviteLink = getUserInviteLink(userId, ctx);
+  let msg = 'Invite friends and earn rewards every time they trade using the bot.' + `\n\n<b>Your Invite Link:</b> <a href='${inviteLink}'>${inviteLink}</a>`;
+  await ctx.reply(msg, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [
+        Markup.button.url('🔗 Open Invite Link', inviteLink),
+        Markup.button.callback('🔄 Main Menu', 'back_to_menu')
+      ],
+      [
+        Markup.button.switchToChat('📤 Share Invite Link', inviteLink)
+      ]
+    ])
+  });
 });
 
 // ========== Main Commands ========== //
@@ -290,7 +532,7 @@ bot.start(async (ctx) => {
   }
   if (!hasWallet(users[userId])) {
     awaitingUsers[userId] = 'choose_wallet_action';
-    await ctx.reply('Welcome! You need a wallet to use the bot. Please choose:', walletKeyboard());
+    await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
     return;
   }
   await sendMainMenu(ctx);
@@ -299,38 +541,27 @@ bot.start(async (ctx) => {
 bot.command('menu', async (ctx) => {
   const userId = String(ctx.from?.id);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to use the bot. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   await sendMainMenu(ctx);
 });
 
 bot.command('help', async (ctx) => {
-  await ctx.reply(
-    '🤖 *Bot Usage Guide*\n\n' +
-    '• /tokens — View the latest pump.fun tokens\n' +
-    '• /buy — Buy a token by mint address\n' +
-    '• /sell — Sell a token by mint address\n' +
-    '• /strategy — Set your auto-buy strategy\n' +
-    '• /exportkey — Export your private key (be careful!)\n' +
-    '• /activity — View your activity\n' +
-    '• /menu — Show main menu\n' +
-    '\nTo get started, try /tokens or set your strategy with /strategy.',
-    { parse_mode: 'Markdown' }
-  );
+  await ctx.reply(helpMessages.help, { parse_mode: 'Markdown' });
 });
 
 // ========== Strategy Setup ========== //
 bot.command('strategy', async (ctx) => {
   const userId = String(ctx.from?.id);
-  awaitingUsers[userId] = 'await_strategy_all';
+  awaitingUsers[userId] = 'await_strategy_volume';
   await ctx.reply(
-    '⚙️ <b>Enter your strategy as: SOL,holders,minutes</b>\nExample: <code>0.5,50,10</code>\n' +
-    '• SOL: Minimum trading volume in SOL\n' +
-    '• holders: Minimum number of holders\n' +
-    '• minutes: Minimum age in minutes\n' +
-    'You can disable the strategy with /strategy_off or enable it with /strategy_on\n' +
-    'Show your current strategy with /strategy_show',
-    { parse_mode: 'HTML' }
+    '⚙️ <b>Strategy Setup</b>\n\n' +
+    'Step 1/3: Enter minimum trading volume in SOL (e.g. 0.5):\n' +
+    '💡 <i>Volume هو حجم التداول المطلوب ليتم عرض العملة لك. كلما زاد كان أكثر أماناً.</i>',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_strategy')]
+    ]) }
   );
 });
 
@@ -356,7 +587,7 @@ bot.command('strategy_off', async (ctx) => {
 bot.action('show_activity', async (ctx) => {
   const userId = String(ctx.from?.id);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to view your activity. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   const history = users[userId]?.history || [];
   const text = history.length ? history.map((h: string) => `• ${h}`).join('\n') : 'No activity yet.';
@@ -370,16 +601,16 @@ bot.command('exportkey', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (!user || !user.secret) {
-    return await ctx.reply('You need a wallet to export the private key. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
-  await ctx.reply('⚠️ *Warning: Your private key gives full control over your funds. Never share it with anyone!*\n\nYour private key (base64):\n' + user.secret, { parse_mode: 'Markdown' });
+  await ctx.reply(helpMessages.export_warning + user.secret, { parse_mode: 'Markdown' });
 });
 
 // ========== Buy & Sell ========== //
 bot.command('buy', async (ctx) => {
   const userId = String(ctx.from?.id);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to buy tokens. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   awaitingUsers[userId + '_buy'] = true;
   ctx.reply('🔍 Send the token mint address to buy:');
@@ -388,49 +619,106 @@ bot.command('buy', async (ctx) => {
 bot.command('sell', async (ctx) => {
   const userId = String(ctx.from?.id);
   if (!hasWallet(users[userId])) {
-    return await ctx.reply('You need a wallet to sell tokens. Please choose:', walletKeyboard());
+    return await ctx.reply(helpMessages.wallet_needed, walletKeyboard());
   }
   awaitingUsers[userId + '_sell'] = true;
   ctx.reply('💰 Send the token mint address to sell:');
 });
 
 // ========== Tokens List ========== //
+
+
+
 bot.command(['tokens', 'pumpfun', 'list'], async (ctx) => {
   const userId = String(ctx.from?.id);
-  await ctx.reply('Fetching the latest trending tokens ...');
+  await ctx.reply('Fetching the latest tokens matching your strategy ...');
   try {
-    let tokens;
-    try {
-      // جرب birdeye أولاً
-      tokens = await fetchBirdeyeTokens();
-    } catch (err) {
-      // إذا فشل birdeye جرب pump.fun fallback
-      try {
-        tokens = await fetchPumpFunTokens();
-      } catch {}
-    }
-    console.log('DEBUG: fetchTokens() result for /tokens:', tokens);
-    if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
-      await ctx.reply('No tokens found at the moment. (Debug: ' + JSON.stringify(tokens) + ')');
+    let tokens = await getCachedTokenList();
+    if (!tokens || tokens.length === 0) {
+      await ctx.reply('No tokens found from the available sources. Try again later.');
       return;
     }
-    const top = tokens.slice(0, 10);
-    let msg = '<b>Trending Solana tokens:</b>\n';
-    msg += top.map((t, i) => {
-      let vol = '-';
-      if ('volume24h' in t && typeof t.volume24h === 'number') vol = t.volume24h.toLocaleString();
-      else if ('volume' in t && typeof t.volume === 'number') vol = t.volume.toLocaleString();
-      return `\n${i+1}. ${t.symbol} | MC: $${t.marketCap?.toLocaleString?.() ?? '-'} | Vol: ${vol} | <code>${t.address}</code>`;
-    }).join('\n');
+    // Apply user strategy filter if available
+    const strat = users[userId]?.strategy;
+    let filtered = tokens;
+    if (strat && strat.enabled) {
+      filtered = tokens.filter((t: any) => {
+        let ok = true;
+        // If property is missing, consider it as matching
+        if (typeof strat.minVolume === 'number') {
+          if (typeof t.volume === 'number') ok = ok && t.volume >= strat.minVolume;
+          else ok = ok && true;
+        }
+        if (typeof strat.minHolders === 'number') {
+          if (typeof t.holders === 'number') ok = ok && t.holders >= strat.minHolders;
+          else ok = ok && true;
+        }
+        if (typeof strat.minAge === 'number') {
+          if (typeof t.age === 'number') ok = ok && t.age >= strat.minAge;
+          else ok = ok && true;
+        }
+        return ok;
+      });
+    }
+    // Sort by volume if available
+    const sorted = filtered
+      .filter((t: any) => typeof t.volume === 'number')
+      .sort((a: any, b: any) => b.volume - a.volume)
+      .slice(0, 10);
+
+    users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
+    users[userId].lastTokenList = sorted;
+    users[userId].history = users[userId].history || [];
+    users[userId].history.push('Viewed tokens matching strategy');
+    saveUsers();
+
+    let msg = '<b>Top Solana tokens matching your strategy:</b>\n';
+    if (sorted.length === 0) {
+      msg += '\nNo tokens match your strategy at the moment.';
+    } else {
+      msg += sorted.map((t: any, i: number) => {
+        let symbol = t.symbol || '-';
+        let name = t.name || '-';
+        let solscanLink = `https://solscan.io/token/${t.address}`;
+        let volume = t.volume ? t.volume.toLocaleString() : '-';
+        let maxVol = sorted[0]?.volume || 1;
+        let barLen = Math.round((t.volume / maxVol) * 20);
+        let bar = '▮'.repeat(barLen) + '▯'.repeat(20 - barLen);
+        return `\n${i+1}. <b>${symbol}:</b> <code>${t.address}</code>\n` +
+          `Name: ${name}\n` +
+          `Volume: ${volume} <code>${bar}</code>\n` +
+          `<a href='${solscanLink}'>View on Solscan</a>\n` +
+          `<b>Add to Honey Points:</b> /add_honey_${i}`;
+      }).join('\n');
+    }
     await ctx.reply(msg, {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([[Markup.button.callback('Refresh', 'refresh_tokens')]])
     });
-    users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
-    users[userId].history.push('Viewed trending tokens list');
-    saveUsers();
   } catch (e: any) {
     await ctx.reply('Error fetching tokens: ' + getErrorMessage(e));
+  }
+});
+
+// Add token from trending list to Honey Points strategy
+bot.action(/add_honey_(\d+)/, async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const idx = Number(ctx.match[1]);
+  const token = users[userId]?.lastTokenList?.[idx];
+  if (!token) return ctx.reply('Token not found.');
+  // Default Honey Points settings
+  const honeyToken = {
+    address: token.address,
+    buyAmount: 0.01,
+    profitPercents: [1, 2, 3],
+    soldPercents: [30, 30, 40]
+  };
+  try {
+    addHoneyToken(userId, honeyToken, users);
+    saveUsers();
+    await ctx.reply(`✅ Token <b>${token.symbol}</b> added to Honey Points strategy.`, { parse_mode: 'HTML' });
+  } catch (e: any) {
+    await ctx.reply('❌ ' + e.message);
   }
 });
 
@@ -438,25 +726,18 @@ bot.action('refresh_tokens', async (ctx) => {
   const userId = String(ctx.from?.id);
   await ctx.reply('Refreshing tokens...');
   try {
-    let tokens;
-    try {
-      tokens = await fetchBirdeyeTokens();
-    } catch (err) {
-      try {
-        tokens = await fetchPumpFunTokens();
-      } catch {}
+    let tokens = await fetchTrendingBirdeye();
+    if (!tokens || tokens.length === 0) {
+      tokens = await fetchTrendingPumpFun();
     }
-    console.log('DEBUG: fetchTokens() result for refresh:', tokens);
-    if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
-      await ctx.reply('No tokens found at the moment. (Debug: ' + JSON.stringify(tokens) + ')');
+    if (!tokens || tokens.length === 0) {
+      await ctx.reply('No tokens found at the moment.');
       return;
     }
     const top = tokens.slice(0, 10);
     let msg = '<b>Trending Solana tokens:</b>\n';
     msg += top.map((t, i) => {
-      let vol = '-';
-      if ('volume24h' in t && typeof t.volume24h === 'number') vol = t.volume24h.toLocaleString();
-      else if ('volume' in t && typeof t.volume === 'number') vol = t.volume.toLocaleString();
+      let vol = t.volume ? t.volume.toLocaleString() : '-';
       return `\n${i+1}. ${t.symbol || '-'} | MC: $${t.marketCap?.toLocaleString?.() ?? '-'} | Vol: ${vol} | <code>${t.address}</code>`;
     }).join('\n');
     await ctx.reply(msg, { parse_mode: 'HTML' });
@@ -473,80 +754,280 @@ bot.on('text', async (ctx) => {
   user.lastMessageAt = Date.now();
   limitHistory(user);
 
-  // Restore wallet
+  // Restore wallet from private key
   if (awaitingUsers[userId] === 'await_restore_secret') {
-    if (!text || text.length < 80) {
-      await ctx.reply('❌ Private key is too short or invalid. Please send a base64-encoded private key (usually more than 80 characters).');
-      return;
-    }
+    // 1. Try base64 directly
+    let base64Key = text;
+    let secretKey: Buffer | null = null;
+    let success = false;
     try {
-      const secret = Buffer.from(text, 'base64');
-      if (secret.length !== 64) {
-        await ctx.reply('❌ Invalid private key length. It must be 64 bytes (base64).');
-        return;
-      }
-      const keypair = Keypair.fromSecretKey(secret);
-      const publicKey = keypair.publicKey.toBase58();
-      user.wallet = publicKey;
-      user.secret = text;
-      user.history.push('Wallet restored');
-      saveUsers();
-      delete awaitingUsers[userId];
-      await ctx.reply('✅ Wallet restored successfully!\nAddress: ' + publicKey, { parse_mode: 'Markdown' });
-      await sendMainMenu(ctx);
-    } catch (err) {
-      await ctx.reply('❌ Invalid private key or not a base64-encoded Solana wallet.');
+      secretKey = Buffer.from(base64Key, 'base64');
+      if (secretKey.length === 64) success = true;
+    } catch {}
+    // 2. If not, try plain text (not base64, not JSON array)
+    if (!success && /^[A-Za-z0-9]{64,}$/.test(text) && text.length >= 64 && text.length <= 100) {
+      try {
+        // Convert plain text to bytes (utf-8), pad or trim to 64 bytes
+        let buf = Buffer.from(text, 'utf-8');
+        if (buf.length < 64) {
+          // Pad with zeros if less than 64 bytes
+          let padded = Buffer.alloc(64);
+          buf.copy(padded);
+          buf = padded;
+        } else if (buf.length > 64) {
+          buf = buf.slice(0, 64);
+        }
+        secretKey = buf;
+        base64Key = buf.toString('base64');
+        if (secretKey.length === 64) success = true;
+      } catch {}
     }
+    // 3. If not, try if user entered numbers (JSON Array)
+    if (!success && text.startsWith('[') && text.endsWith(']')) {
+      try {
+        const arr = JSON.parse(text);
+        if (Array.isArray(arr) && arr.length === 64) {
+          secretKey = Buffer.from(arr);
+          base64Key = secretKey.toString('base64');
+          success = true;
+        }
+      } catch {}
+    }
+    // 4. If conversion succeeded
+    if (success && secretKey) {
+      try {
+        const keypair = Keypair.fromSecretKey(secretKey);
+        users[userId].wallet = keypair.publicKey.toBase58();
+        users[userId].secret = base64Key;
+        users[userId].history = users[userId].history || [];
+        users[userId].history.push('Wallet restored from private key');
+        saveUsers();
+        delete awaitingUsers[userId];
+        await ctx.reply('✅ Wallet restored successfully! Your address: ' + users[userId].wallet);
+        await sendMainMenu(ctx);
+        return;
+      } catch (e: any) {}
+    }
+    // 5. If everything failed
+    await ctx.reply('❌ Invalid or unsupported private key. Please send your Solana secret key in base64, plain text, or as a JSON array.\nPress Cancel to exit.');
     return;
   }
+// Cancel wallet restore button
+bot.action('cancel_restore_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  if (awaitingUsers[userId] === 'await_restore_secret') {
+    delete awaitingUsers[userId];
+    await ctx.reply('❌ Wallet restore process cancelled. You can return to the main menu.',
+      {...Markup.inlineKeyboard([[Markup.button.callback('🔄 Main Menu', 'back_to_menu')]])}
+    );
+  }
+});
 
-  // Strategy setup (all at once)
-  if (awaitingUsers[userId] === 'await_strategy_all') {
-    const parts = text.split(',').map(s => s.trim());
-    if (parts.length !== 3) return ctx.reply('❌ Please enter the values like: 0.5,50,10');
-    const [v, h, a] = parts;
-    const minVolume = parseFloat(v); // in SOL
-    const minHolders = parseInt(h);
-    const minAge = parseInt(a); // in minutes
-    if (isNaN(minVolume) || minVolume < 0.01) return ctx.reply('❌ Volume must be a number greater than or equal to 0.01 SOL.');
-    if (isNaN(minHolders) || minHolders < 10) return ctx.reply('❌ Holders must be a number greater than or equal to 10.');
-    if (isNaN(minAge) || minAge < 1) return ctx.reply('❌ Age must be a number greater than or equal to 1 minute.');
-    user.strategy = { minVolume, minHolders, minAge, enabled: true };
-    user.history.push(`Saved strategy: Volume ≥ ${minVolume} SOL, Holders ≥ ${minHolders}, Age ≥ ${minAge} min`);
+  // Honey Points steps with token address validation
+  if (awaitingUsers[userId] === 'await_honey_address') {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+      return ctx.reply('❌ Invalid token address.');
+    }
+    // Validate address via API
+    try {
+      const info = await fetchTokenInfo(text);
+      if (!info || !info.symbol) {
+        return ctx.reply('❌ Token address not found or invalid.');
+      }
+    } catch {
+      return ctx.reply('❌ Could not verify token address.');
+    }
+    user.honeyTemp = { address: text };
+    awaitingUsers[userId] = 'await_honey_amount';
+    await ctx.reply('💰 Enter buy amount in SOL (e.g. 0.01):', { ...Markup.inlineKeyboard([
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_honey')]
+    ]) });
+    return;
+  }
+  if (awaitingUsers[userId] === 'await_honey_amount') {
+    const buyAmount = parseFloat(text);
+    if (isNaN(buyAmount) || buyAmount <= 0) {
+      return ctx.reply('❌ Enter a valid amount > 0.');
+    }
+    user.honeyTemp = user.honeyTemp || {};
+    user.honeyTemp.buyAmount = buyAmount;
+    awaitingUsers[userId] = 'await_honey_profit';
+    await ctx.reply('🎯 Enter profit percentages as comma separated (e.g. 1,2,3):', { ...Markup.inlineKeyboard([
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_honey')]
+    ]) });
+    return;
+  }
+  if (awaitingUsers[userId] === 'await_honey_profit') {
+    const profitPercents = text.split(',').map(s => parseFloat(s.trim())).filter(n => n >= 1 && n <= 20);
+    if (!profitPercents.length || profitPercents.length > 3) {
+      return ctx.reply('❌ Enter 1-3 profit percentages between 1 and 20.');
+    }
+    user.honeyTemp = user.honeyTemp || {};
+    user.honeyTemp.profitPercents = profitPercents;
+    awaitingUsers[userId] = 'await_honey_sell';
+    await ctx.reply('📤 Enter sell percentages as comma separated (total 100, e.g. 30,30,40):', { ...Markup.inlineKeyboard([
+      [Markup.button.callback('Cancel', 'cancel_input')],
+      [Markup.button.callback('Back', 'back_honey')]
+    ]) });
+    return;
+  }
+  if (awaitingUsers[userId] === 'await_honey_sell') {
+    const soldPercents = text.split(',').map(s => parseFloat(s.trim()));
+    user.honeyTemp = user.honeyTemp || {};
+    if (!user.honeyTemp.profitPercents || soldPercents.length !== user.honeyTemp.profitPercents.length || soldPercents.reduce((a,b)=>a+b,0) !== 100) {
+      return ctx.reply('❌ Sell percentages must match profit stages and total 100%.');
+    }
+    user.honeyTemp.soldPercents = soldPercents;
+    // Summary before saving with edit buttons
+    const temp = user.honeyTemp || {};
+    await ctx.reply(
+      `✅ Honey Points token ready:\n• Address: <code>${temp.address ?? ''}</code>\n• Amount: <b>${temp.buyAmount ?? ''} SOL</b>\n• Profit %: <b>${(temp.profitPercents ?? []).join(',')}</b>\n• Sell %: <b>${(temp.soldPercents ?? []).join(',')}</b>`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+        [Markup.button.callback('Save Honey Token', 'save_honey_token')],
+        [Markup.button.callback('Edit', 'edit_honey_token')],
+        [Markup.button.callback('Cancel', 'cancel_input')]
+      ]) }
+    );
+    return;
+  }
+// Honey Points back button
+bot.action('back_honey', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  if (awaitingUsers[userId] === 'await_honey_amount') {
+    awaitingUsers[userId] = 'await_honey_address';
+    await ctx.reply('🔙 Back: Enter token address:', { parse_mode: 'HTML' });
+  } else if (awaitingUsers[userId] === 'await_honey_profit') {
+    awaitingUsers[userId] = 'await_honey_amount';
+    await ctx.reply('🔙 Back: Enter buy amount in SOL:', { parse_mode: 'HTML' });
+  } else if (awaitingUsers[userId] === 'await_honey_sell') {
+    awaitingUsers[userId] = 'await_honey_profit';
+    await ctx.reply('🔙 Back: Enter profit percentages:', { parse_mode: 'HTML' });
+  }
+});
+// Direct edit from summary
+bot.action('edit_honey_token', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  if (!users[userId]?.honeyTemp) return ctx.reply('No Honey Points token to edit.');
+  awaitingUsers[userId] = 'await_honey_address';
+  await ctx.reply('✏️ Edit Honey Points: Enter token address:', { parse_mode: 'HTML' });
+});
+// ========== Real-time Honey Points Monitoring ========== //
+async function getPrice(address: string): Promise<number> {
+  // Unified official sources (Birdeye, Pump.fun, Solscan, Coingecko)
+  const info = await fetchTokenInfo(address);
+  if (info && typeof info.price === 'number' && info.price > 0) {
+    return info.price;
+  }
+  // fallback: try to get price from Solscan directly if not present
+  try {
+    const res = await fetch(`https://public-api.solscan.io/token/meta?tokenAddress=${address}`);
+    const meta = await res.json();
+    if (meta?.priceUsdt && typeof meta.priceUsdt === 'number') {
+      return meta.priceUsdt;
+    }
+  } catch {}
+  return 0;
+}
+
+async function honeyAutoBuy(address: string, amount: number, secret: string): Promise<string> {
+  // Use existing autoBuy logic
+  return await autoBuy(address, amount, secret);
+}
+
+async function honeyAutoSell(address: string, amount: number, secret: string): Promise<string> {
+  // Use existing sellWithOrca logic
+  await sellWithOrca(address, amount);
+  return '';
+}
+
+async function honeyMonitor() {
+  for (const userId in users) {
+    const honey = getHoneySettings(userId, users);
+    if (!honey.tokens || honey.tokens.length === 0) continue;
+    try {
+      await executeHoneyStrategy(
+        userId,
+        users,
+        getPrice,
+        async (address, amount, secret) => {
+          const tx = await honeyAutoBuy(address, amount, secret);
+          await bot.telegram.sendMessage(userId, `🍯 Auto-buy executed for ${address} | Amount: ${amount} SOL | Tx: ${tx}`);
+          return tx;
+        },
+        async (address, amount, secret) => {
+          const tx = await honeyAutoSell(address, amount, secret);
+          await bot.telegram.sendMessage(userId, `🍯 Auto-sell executed for ${address} | Amount: ${amount} SOL | Tx: ${tx}`);
+          return tx;
+        }
+      );
+      saveUsers();
+    } catch (e: any) {
+      // Optionally notify user of error
+      // await bot.telegram.sendMessage(userId, `🍯 Honey Points error: ${e.message}`);
+    }
+  }
+}
+
+setInterval(honeyMonitor, 5000); // Real-time: every 5 seconds
+
+  // Step-by-step strategy input
+  if (awaitingUsers[userId] === 'await_strategy_volume') {
+    const minVolume = parseFloat(text);
+    if (isNaN(minVolume) || minVolume < 0.01) {
+      return ctx.reply('❌ Volume must be a number ≥ 0.01 SOL.');
+    }
+    user.strategy = user.strategy || {};
+    user.strategy.minVolume = minVolume;
+    awaitingUsers[userId] = 'await_strategy_holders';
+    await ctx.reply(
+      `✅ Volume set: <b>${minVolume} SOL</b>\n\nStep 2/3: Enter minimum holders (e.g. 50):`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+        [Markup.button.callback('Cancel', 'cancel_input')],
+        [Markup.button.callback('Back', 'back_strategy')]
+      ]) }
+    );
+    return;
+  }
+  if (awaitingUsers[userId] === 'await_strategy_holders') {
+    const minHolders = parseInt(text);
+    if (isNaN(minHolders) || minHolders < 10) {
+      return ctx.reply('❌ Holders must be a number ≥ 10.');
+    }
+    user.strategy = user.strategy || {};
+    user.strategy.minHolders = minHolders;
+    awaitingUsers[userId] = 'await_strategy_age';
+    await ctx.reply(
+      `✅ Holders set: <b>${minHolders}</b>\n\nStep 3/3: Enter minimum age in minutes (e.g. 10):`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+        [Markup.button.callback('Cancel', 'cancel_input')],
+        [Markup.button.callback('Back', 'back_strategy')]
+      ]) }
+    );
+    return;
+  }
+  if (awaitingUsers[userId] === 'await_strategy_age') {
+    const minAge = parseInt(text);
+    if (isNaN(minAge) || minAge < 1) {
+      return ctx.reply('❌ Age must be a number ≥ 1 minute.');
+    }
+    user.strategy = user.strategy || {};
+    user.strategy.minAge = minAge;
+    user.strategy.enabled = true;
+    user.history = user.history || [];
+    user.history.push(`Saved strategy: Volume ≥ ${user.strategy.minVolume} SOL, Holders ≥ ${user.strategy.minHolders}, Age ≥ ${user.strategy.minAge} min`);
+    user.history = user.history || [];
     saveUsers();
     delete awaitingUsers[userId];
-    // Fetch matching tokens
-    try {
-      await ctx.reply('🔎 Fetching tokens matching your strategy...');
-      const tokens = await fetchPumpFunTokens();
-      console.log('DEBUG: fetchPumpFunTokens() result:', tokens);
-      if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
-        await ctx.reply('No tokens fetched from API. (Debug: ' + JSON.stringify(tokens) + ')');
-      } else {
-        const alreadyBought = boughtTokens[userId] || new Set();
-        const matches = tokens.filter(token => {
-          let ok = true;
-          if (typeof token.holders === 'number') ok = ok && token.holders >= minHolders;
-          if (typeof token.ageMinutes === 'number') ok = ok && token.ageMinutes >= minAge;
-          // Assume token.volume is in SOL
-          if (typeof token.volume === 'number') ok = ok && token.volume >= minVolume;
-          if (alreadyBought.has(token.address)) ok = false;
-          return ok;
-        });
-        let msg = '<b>Tokens matching your strategy:</b>\n';
-        if (!matches.length) {
-          msg += '\nNo tokens currently match your strategy.';
-        } else {
-          msg += matches.slice(0, 10).map((t, i) =>
-            `\n${i+1}. ${t.symbol || '-'} | MC: $${t.marketCap ? t.marketCap.toLocaleString() : '-'} | Vol: ${t.volume ? t.volume.toLocaleString() + ' SOL' : '-'} | Holders: ${t.holders ?? '-'} | Age: ${t.ageMinutes ?? '-'}m\n<code>${t.address}</code>`
-          ).join('\n');
-        }
-        await ctx.reply(msg, { parse_mode: 'HTML' });
-      }
-    } catch (e: any) {
-      await ctx.reply('Error fetching tokens: ' + getErrorMessage(e));
-    }
-    return ctx.reply('✅ Strategy saved and enabled!');
+    await ctx.reply(
+      `✅ Strategy saved!\n\n<b>Summary:</b>\n• Volume ≥ <b>${user.strategy.minVolume} SOL</b>\n• Holders ≥ <b>${user.strategy.minHolders}</b>\n• Age ≥ <b>${user.strategy.minAge} min</b>`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+        [Markup.button.callback('Edit Strategy', 'edit_strategy')],
+        [Markup.button.callback('Show Active Targets', 'show_active_targets')]
+      ]) }
+    );
+    return;
   }
 // Show current strategy
 bot.command('strategy_show', async (ctx) => {
@@ -577,6 +1058,7 @@ bot.command('strategy_show', async (ctx) => {
     try {
       const amount = 0.01; // Default buy amount in SOL
       const tx = await autoBuy(tokenMint, amount, user.secret);
+      user.history = user.history || [];
       user.history.push(`Buy: ${tokenMint} | Amount: ${amount} SOL | Tx: ${tx}`);
       saveUsers();
       await ctx.reply(
@@ -621,6 +1103,7 @@ bot.command('strategy_show', async (ctx) => {
     try {
       const amount = 0.01; // Default sell amount in SOL (can be improved to fetch actual balance)
       const tx = await sellWithOrca(tokenMint, amount);
+      user.history = user.history || [];
       user.history.push(`Sell: ${tokenMint} | Amount: ${amount} SOL | Tx: ${tx}`);
       saveUsers();
       await ctx.reply(
@@ -649,7 +1132,7 @@ bot.command('strategy_show', async (ctx) => {
 
   // Fallback
   await ctx.reply(
-    'Unknown command or input. Type /help to see available commands.',
+    helpMessages.unknown_command,
     Markup.inlineKeyboard([
       [Markup.button.callback('Main Menu', 'back_to_menu')]
     ])
@@ -665,3 +1148,66 @@ bot.launch()
     console.log('========================================');
   })
   .catch((err) => console.error('❌ Bot launch failed:', err));
+
+// Copy Trade button handler
+bot.action('copy_trade', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  await ctx.reply(helpMessages.copy_trade);
+  const user = users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
+  user.copiedWallets = user.copiedWallets || [];
+  let msg = '<b>Copy Trading Setup</b>\n\n';
+  if (user.copiedWallets.length) {
+    msg += 'Currently copying these wallets:\n' + user.copiedWallets.map((w: string, i: number) => `${i+1}. <code>${w}</code>`).join('\n') + '\n\n';
+  } else {
+    msg += 'No wallets are being copied yet.\n\n';
+  }
+  msg += 'You can add a wallet to copy its trades, or remove an existing one.';
+  await ctx.reply(msg, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Wallet', 'add_copy_wallet')],
+      ...(user.copiedWallets.length ? [[Markup.button.callback('➖ Remove Wallet', 'remove_copy_wallet')]] : []),
+      [Markup.button.callback('🔄 Main Menu', 'back_to_menu')]
+    ])
+  });
+});
+
+// Add wallet to copy
+bot.action('add_copy_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  awaitingUsers[userId] = 'await_copy_wallet_add';
+  await ctx.reply('Send the wallet address you want to copy:');
+});
+
+// Remove wallet from copy list
+bot.action('remove_copy_wallet', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId] = users[userId] || { trades: 0, activeTrades: 1, history: [] };
+  if (!user.copiedWallets || !user.copiedWallets.length) {
+    return ctx.reply('No wallets to remove.');
+  }
+  awaitingUsers[userId] = 'await_copy_wallet_remove';
+  let msg = 'Send the wallet address you want to remove from your copy list:\n' + user.copiedWallets.map((w: string, i: number) => `${i+1}. <code>${w}</code>`).join('\n');
+  await ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
+
+// At the end of the file, after honeyMonitor interval:
+setInterval(() => {
+  // Prepare users for portfolioTracker
+  const trackerUsers: Record<string, any> = {};
+  for (const userId in users) {
+    const u = users[userId];
+    if (u.copiedWallets && u.copiedWallets.length && u.secret && u.wallet) {
+      trackerUsers[userId] = {
+        userId,
+        copiedWallets: u.copiedWallets,
+        secret: u.secret,
+        wallet: u.wallet
+      };
+    }
+  }
+  if (Object.keys(trackerUsers).length) {
+    monitorCopiedWallets(trackerUsers);
+  }
+}, 10000); // Every 10 seconds
